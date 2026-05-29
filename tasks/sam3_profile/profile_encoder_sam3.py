@@ -303,7 +303,7 @@ def main():
         "--algo",
         type=str,
         default="none",
-        choices=["none", "sparsesam"],
+        choices=["none", "sparsesam", "sheafsam"],
         help="Run a second pass with this SparseSAM variant and "
         "print a baseline-vs-patched comparison table.",
     )
@@ -344,21 +344,25 @@ def main():
         print_report(t_base, args.n_runs, args.batch_size, vit, label="baseline")
         return
 
-    from algos.sparsesam.sam3 import apply_patch, remove_patch
+    algo_label = args.algo
+    if args.algo == "sheafsam":
+        from algos.sheafsam.sam3 import apply_patch, remove_patch
+    else:
+        from algos.sparsesam.sam3 import apply_patch, remove_patch
 
-    print(f"\n── SparseSAM MLP-merge ratio={args.ratio} ──")
+    print(f"\n── {algo_label} MLP-merge ratio={args.ratio} ──")
     apply_patch(vit, ratio=args.ratio, mlp_merge=(not args.no_mlp_merge))
     t_patch = _run_profile(
-        vit, dummy, args.n_warmup, args.n_runs, f"sparsesam r={args.ratio}"
+        vit, dummy, args.n_warmup, args.n_runs, f"{algo_label} r={args.ratio}"
     )
     remove_patch(vit)
 
     print_report(t_base, args.n_runs, args.batch_size, vit, label="baseline")
     print_report(
-        t_patch, args.n_runs, args.batch_size, vit, label=f"sparsesam r={args.ratio}"
+        t_patch, args.n_runs, args.batch_size, vit, label=f"{algo_label} r={args.ratio}"
     )
     print_comparison(
-        t_base, t_patch, vit, args.n_runs, args.batch_size, args.algo, args.ratio
+        t_base, t_patch, vit, args.n_runs, args.batch_size, algo_label, args.ratio
     )
 
 

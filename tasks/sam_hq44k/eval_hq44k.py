@@ -24,6 +24,10 @@ _REPO = os.path.abspath(os.path.join(_HERE, "..", ".."))
 sys.path.insert(0, _REPO)
 sys.path.insert(0, os.path.join(_REPO, "algos", "3rd_party", "sam-hq"))
 
+# Make the HQ-SAM training utilities importable as top-level "samhq_utils" / "training"
+_train_dir = os.path.join(_REPO, "algos", "3rd_party", "sam-hq", "train")
+sys.path.insert(0, _train_dir)
+
 from segment_anything import SamPredictor, sam_model_registry
 
 from algos.registry import (
@@ -44,10 +48,10 @@ def reset_memory():
 
 
 from utils.data_utils import get_default_datasets
-from train.utils.dataloader import get_im_gt_name_dict, Resize
+from samhq_utils.dataloader import get_im_gt_name_dict, Resize
 from utils.data_utils import OnlineDataset
-import train.utils.misc as misc
-from train.train import compute_iou, compute_boundary_iou
+import samhq_utils.misc as misc
+from training import compute_iou, compute_boundary_iou
 
 
 def custom_collate_fn(batch):
@@ -109,10 +113,30 @@ def process_batch(predictor, images, labels_boxes, labels_ori):
         predictor.original_size    = (images.shape[2], images.shape[3])
         predictor.input_size       = tuple(transformed.shape[-2:])
         predictor.is_image_set     = True
+
+        # Stronger runtime workaround for HQ-SAM fp16 + hq_token_only:
+        # The mask decoder and prompt encoder can still produce fp16 tensors internally.
+        # We temporarily move only those two submodules to fp32 for the quality decode.
+        if predictor.features is not None:
+            predictor.features = predictor.features.float()
+            predictor.interm_features = [f.float() for f in predictor.interm_features]
+
+        mask_decoder = predictor.model.mask_decoder
+        prompt_encoder = predictor.model.prompt_encoder
+
+        try:
+            md_dtype = next(mask_decoder.parameters()).dtype
+            pe_dtype = next(prompt_encoder.parameters()).dtype
+        except StopIteration:
+            md_dtype = pe_dtype = torch.float16
+
+        mask_decoder.float()
+        prompt_encoder.float()
+
         try:
             masks, _, _ = predictor.predict_torch(
                 point_coords=None, point_labels=None,
-                boxes=labels_boxes[i:i+1], hq_token_only=True,
+                boxes=labels_boxes[i:i+1].float(), hq_token_only=True,
             )
             ious.append(compute_iou(masks, labels_ori[i:i+1]))
             b_ious.append(compute_boundary_iou(masks, labels_ori[i:i+1]))
@@ -120,6 +144,12 @@ def process_batch(predictor, images, labels_boxes, labels_ori):
             print(f"  decode error image {i}: {e}")
             ious.append(torch.tensor(0.0, device=device))
             b_ious.append(torch.tensor(0.0, device=device))
+        finally:
+            # Restore precision on decoder modules
+            if md_dtype == torch.float16:
+                mask_decoder.half()
+            if pe_dtype == torch.float16:
+                prompt_encoder.half()
 
     return {
         'encoder_ms':           encoder_ms,
@@ -225,6 +255,7 @@ def run_sweep(
     margin: float,
     diagonal_width: int = 1,
     mlp_merge: bool = True,
+    args = None,
 ) -> List[Dict]:
 
     encoder = predictor.model.image_encoder
@@ -254,7 +285,7 @@ def run_sweep(
     for algo, ratio in runs:
         remove_all_sam(encoder, mask_decoder=mask_decoder)
         if algo != "none" and ratio < 1.0:
-            apply_sam(encoder, algo, ratio=ratio, margin=margin,
+            apply_sam(encoder, algo, args=args, ratio=ratio, margin=margin,
                       mlp_merge=mlp_merge)
 
         n_tokens = int(64 * 64 * ratio) if algo != "none" else 64 * 64
@@ -413,6 +444,63 @@ def main():
     parser.add_argument('--mlp-merge', action=argparse.BooleanOptionalAction, default=True,
                         help='(sparsesam) MLP on top-K keep tokens (default) vs full N.')
 
+    # SheafSAM specific flags (see sheafSAM.html)
+    parser.add_argument(
+        "--perm-mode",
+        default="z_interleave_sort",
+        choices=[
+            "z_interleave_sort",
+            "z_interleave_nosort",
+            "z_naive_sort",
+            "z_naive_nosort",
+            "hilbert_interleave_sort",
+            "hilbert_interleave_nosort",
+            "hilbert_naive_sort",
+            "hilbert_naive_nosort",
+        ],
+    )
+
+    parser.add_argument(
+        "--profile",
+        default=None,
+        choices=["fast", "quality", "proj", "cob4", "cob8", "cob-ms", "lap4", "lap8", "cob8-quality", "route-ablation", "sparse-equiv"],
+        help="Preset: fast=sheaf+sparse_route, quality=sheaf+full, "
+             "route-ablation=sparse+sheaf_route, "
+             "sparse-equiv=sparse+sparse_route",
+    )
+
+    parser.add_argument(
+        "--sheaf-score-mode",
+        default="sheaf",
+        choices=["sparse", "sheaf", "sheaf_full", "hybrid",
+                "sobel_sheaf", "sobel_k",
+                "coboundary4", "coboundary4_full",
+                "coboundary8", "coboundary8_full",
+                "coboundary_ms", "coboundary_ms_full",
+                "laplacian4", "laplacian8",
+                "sheaf_shuffle"],
+    )
+
+    parser.add_argument("--sheaf-blend", type=float, default=1.0)
+    parser.add_argument("--sheaf-project-dim", type=int, default=16)
+
+    parser.add_argument(
+        "--sheaf-group-reduce",
+        default="mean",
+        choices=["mean", "max"],
+    )
+
+    parser.add_argument(
+        "--sheaf-mlp-mode",
+        default="sparse_route",
+        choices=["sheaf_route", "sheaf_merge", "sparse_route", "full"],
+    )
+
+    parser.add_argument("--sheaf-mlp-quota", type=float, default=0.10)
+
+    parser.add_argument("--sheaf-cell-h", type=int, default=2)
+    parser.add_argument("--sheaf-cell-w", type=int, default=2)
+
     parser.add_argument('--dataset-idx', type=int, nargs='+', default=None)
     parser.add_argument('--no-plot', action='store_true')
 
@@ -422,6 +510,26 @@ def main():
     parser.add_argument('--wandb-run-name', type=str, default=None)
 
     args = parser.parse_args()
+
+    # Apply profile presets (still allow explicit overrides after profile)
+    PROFILES = {
+        "fast":           dict(sheaf_score_mode="sobel_sheaf", sheaf_mlp_mode="sparse_route"),
+        "quality":        dict(sheaf_score_mode="sobel_sheaf", sheaf_mlp_mode="full"),
+        "proj":           dict(sheaf_score_mode="sheaf", sheaf_mlp_mode="sparse_route"),
+        "cob4":           dict(sheaf_score_mode="coboundary4", sheaf_project_dim=16, sheaf_mlp_mode="sparse_route"),
+        "cob8":           dict(sheaf_score_mode="coboundary8", sheaf_project_dim=16, sheaf_mlp_mode="sparse_route"),
+        "cob-ms":         dict(sheaf_score_mode="coboundary_ms", sheaf_project_dim=16, sheaf_mlp_mode="sparse_route"),
+        "lap4":           dict(sheaf_score_mode="laplacian4", sheaf_project_dim=16, sheaf_mlp_mode="sparse_route"),
+        "lap8":           dict(sheaf_score_mode="laplacian8", sheaf_project_dim=16, sheaf_mlp_mode="sparse_route"),
+        "cob8-quality":   dict(sheaf_score_mode="coboundary8", sheaf_project_dim=16, sheaf_mlp_mode="full"),
+        "route-ablation": dict(sheaf_score_mode="sparse", sheaf_mlp_mode="sheaf_route"),
+        "sparse-equiv":   dict(sheaf_score_mode="sparse", sheaf_mlp_mode="sparse_route"),
+    }
+    if args.profile is not None:
+        for k, v in PROFILES[args.profile].items():
+            setattr(args, k, v)
+        print(f"[profile] {args.profile} → score={args.sheaf_score_mode} mlp={args.sheaf_mlp_mode}")
+
     os.makedirs(args.output_dir, exist_ok=True)
 
     if not args.no_wandb:
@@ -446,6 +554,7 @@ def main():
         dataset_indices = dataset_indices,
         margin          = args.margin,
         mlp_merge       = bool(args.mlp_merge),
+        args            = args,
     )
 
     ts  = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')

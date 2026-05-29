@@ -272,12 +272,13 @@ class ToMeSAMBlock(Block):
             perm_mode = info.get("perm_mode", "z_interleave_sort")
             global_cached = info.get("perm_cache", {}).get((H_sp, ratio, _FA2_N_BLOCK_GLOBAL, perm_mode))
             if global_cached is not None:
-                inv_perm_1d_group = global_cached[2]
-                nh = self.attn.num_heads
+                inv_perm_1d_group = global_cached[2]  # may be (B*nh, N) or (B, N)
                 keep_n = max(1, round(ratio * x_seq.shape[1]))
-                # Head-averaged rank — topk on it avoids 2× full-N argsort+gather.
-                avg_rank = inv_perm_1d_group.view(B, nh, -1).float().mean(dim=1)
-                top_idx  = avg_rank.topk(keep_n, dim=1, largest=False).indices
+                # Average across heads if stored per-head, then topk
+                if inv_perm_1d_group.shape[0] != B:
+                    nh = self.attn.num_heads
+                    inv_perm_1d_group = inv_perm_1d_group.view(B, nh, -1).float().mean(dim=1)
+                _, top_idx = inv_perm_1d_group.float().topk(keep_n, dim=1, largest=False)
                 idx_e    = top_idx.unsqueeze(-1).expand(-1, -1, C)
                 x_kept   = x_seq.gather(1, idx_e)
                 x_kept   = x_kept + self.mlp(self.norm2(x_kept))

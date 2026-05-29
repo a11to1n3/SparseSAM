@@ -211,12 +211,30 @@ def _kw_sparge_ratio(args, ratio):
 
 
 def _kw_sam_basic(args, ratio):
-    return dict(
+    kw = dict(
         ratio=float(ratio if ratio is not None else args.ratios[0]),
         margin=float(getattr(args, "margin", 0.5)),
         mlp_merge=bool(getattr(args, "mlp_merge", True)),
         piecewise_block_size=int(getattr(args, "piecewise_block_size", 64)),
     )
+    return kw
+
+
+def _kw_sam_sheaf(args, ratio):
+    base = _kw_sam_basic(args, ratio)
+    base.update(
+        perm_mode=getattr(args, "perm_mode", "z_interleave_sort"),
+        score_mode=getattr(args, "sheaf_score_mode", "hybrid"),
+        sheaf_blend=float(getattr(args, "sheaf_blend", 0.10)),
+        sheaf_project_dim=int(getattr(args, "sheaf_project_dim", 16)),
+        sheaf_group_reduce=getattr(args, "sheaf_group_reduce", "max"),
+        group_size=int(getattr(args, "group_size", 4)),
+        mlp_mode=getattr(args, "sheaf_mlp_mode", "sparse_route"),
+        sheaf_cell_h=int(getattr(args, "sheaf_cell_h", 2)),
+        sheaf_cell_w=int(getattr(args, "sheaf_cell_w", 2)),
+        sheaf_mlp_quota=float(getattr(args, "sheaf_mlp_quota", 0.10)),
+    )
+    return base
 
 
 def _bake_sam_apply(apply_fn, internal_algo: str):
@@ -288,12 +306,17 @@ def _register_pe():
         return AlgoSpec("sparsesam_partial", "pe", apply_pe_sparsesam_partial_patch,
             kwargs_from_args=_kw_pe_partial_sparsesam, category="partial",
             description="Block-sparse cute-kernel attention (perm + keep-bar mask).")
-
+    def mk_sheaf_partial():
+        from .sheafsam.pe_partial import apply_pe_sheaf_partial_patch
+        return AlgoSpec("sheaf_partial", "pe", apply_pe_sheaf_partial_patch,
+            kwargs_from_args=_kw_pe_partial_sparsesam, category="partial",
+            description="Sheaf-ranked block-sparse attention for PE-Core.")
     for name, mk in (("tome", mk_tome), ("gradtome", mk_gradtome),
                      ("sparsesam", mk_sparsesam), ("flash_rope", mk_flash_rope),
                      ("sparge", mk_sparge), ("tome_partial", mk_tome_partial),
                      ("gradtome_partial", mk_gradtome_partial),
-                     ("sparsesam_partial", mk_sparsesam_partial)):
+                     ("sparsesam_partial", mk_sparsesam_partial),
+                     ("sheaf_partial", mk_sheaf_partial)):
         _safe_register("pe", name, mk)
 
 
@@ -324,6 +347,13 @@ def _register_sam():
     def _from_piecewise():
         from .piecewise.sam import apply_patch as fn, PiecewiseSAMAttention as A
         return fn, None, A
+    def _from_sheafsam():
+        from .sheafsam.sam import (
+            apply_patch as fn,
+            SheafSAMBlock as B,
+            SheafSAMAttention as A,
+        )
+        return fn, B, A
 
     # (registered_name, importer, internal_algo, description)
     table = [
@@ -349,13 +379,18 @@ def _register_sam():
         ("piecewise",        _from_piecewise,        "piecewise",
             "Piecewise Sparse Attention (PISA) drop-in attention swap; "
             "decomposed rel-pos bias is preserved."),
+        ("sheafsam",         _from_sheafsam,         "sheafsam",
+            "Sheaf-guided SparseSAM: sheaf-ranked Stripe-Sort attention plus sheaf MLP routing/merge."),
     ]
     for name, importer, internal_algo, desc in table:
         def mk(_imp=importer, _ia=internal_algo, _n=name, _d=desc):
             fn, B, A = _imp()
-            return AlgoSpec(_n, "sam", _bake_sam_apply(fn, _ia),
-                kwargs_from_args=_kw_sam_basic,
-                block_class=B, attn_class=A, description=_d)
+            kw_builder = _kw_sam_sheaf if _n == "sheafsam" else _kw_sam_basic
+            return AlgoSpec(
+                _n, "sam", _bake_sam_apply(fn, _ia),
+                kwargs_from_args=kw_builder,
+                block_class=B, attn_class=A, description=_d,
+            )
         _safe_register("sam", name, mk)
 
 

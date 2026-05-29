@@ -300,10 +300,9 @@ class ToMeSAMBlockRandom(Block):
             global_cached = info.get("perm_cache", {}).get((H_sp, ratio))
             if global_cached is not None:
                 g_perm, g_inv_perm = global_cached
-                nh = self.attn.num_heads
                 keep_n = max(1, round(ratio * x_seq.shape[1]))
-                avg_rank = g_inv_perm.view(B, nh, -1).float().mean(dim=1)
-                top_idx  = avg_rank.topk(keep_n, dim=1, largest=False).indices
+                # Use topk directly (avoids .view(B,nh,-1) reshape bug)
+                _, top_idx = g_inv_perm.topk(keep_n, dim=1, largest=False)
                 idx_e    = top_idx.unsqueeze(-1).expand(-1, -1, C)
                 x_kept   = x_seq.gather(1, idx_e)
                 x_kept   = x_kept + self.mlp(self.norm2(x_kept))

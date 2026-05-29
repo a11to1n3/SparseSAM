@@ -308,18 +308,23 @@ def print_report_sam3(timers, n_runs, model_id, batch_size, vision_enc=None):
 # ToMe helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
-def apply_tome_patch(encoder, algo, ratio, margin):
-    from algos.sparsesam.sam import apply_patch
-    apply_patch(encoder, algo=algo, ratio=ratio, margin=margin)
+def apply_tome_patch(encoder, algo, ratio, margin, **extra):
+    if algo.startswith('sheafsam'):
+        from algos.sheafsam.sam import apply_patch
+        apply_patch(encoder, algo='tome', ratio=ratio, margin=margin, **extra)
+    else:
+        from algos.sparsesam.sam import apply_patch
+        apply_patch(encoder, algo=algo, ratio=ratio, margin=margin)
 
 
 def remove_tome_patch(encoder):
     from algos.sparsesam.sam import ToMeSAMBlock, ToMeSAMAttention
+    from algos.sheafsam.sam import SheafSAMBlock, SheafSAMAttention
     from segment_anything.modeling.image_encoder import Block, Attention
     for m in encoder.modules():
-        if type(m) is ToMeSAMBlock:
+        if type(m) in (ToMeSAMBlock, SheafSAMBlock):
             m.__class__ = Block
-        elif type(m) is ToMeSAMAttention:
+        elif type(m) in (ToMeSAMAttention, SheafSAMAttention):
             m.__class__ = Attention
     encoder.__dict__.pop('forward',    None)
     encoder.__dict__.pop('tome_info',  None)
@@ -519,7 +524,8 @@ def main():
     # ToMe / PiToMe comparison (SAM 1 only)
     parser.add_argument('--tome-algo',   type=str, default='none',
                         choices=['none', 'tome', 'pitome', 'sparsesam', 'sparsesam_pitome',
-                                 'sparsesam-dense'],
+                                 'sparsesam-dense',
+                                 'sheafsam_fast', 'sheafsam_quality'],
                         help="Run a second pass with this algo and show comparison table.")
     parser.add_argument('--tome-ratio',  type=float, default=0.9,
                         help="Token-keep ratio for ToMe/PiToMe (0 < ratio < 1).")
@@ -602,7 +608,10 @@ def main():
     if want_tome:
         print(f"\n── {args.tome_algo.upper()} ratio={args.tome_ratio} ──")
         apply_tome_patch(encoder, algo=args.tome_algo,
-                         ratio=args.tome_ratio, margin=args.tome_margin)
+                         ratio=args.tome_ratio, margin=args.tome_margin,
+                         score_mode='sheaf' if 'sheafsam' in args.tome_algo else 'tome',
+                         mlp_mode='sparse_route' if args.tome_algo == 'sheafsam_fast' else 'full',
+                         sheaf_group_reduce='mean')
         t_tome = _run_profile(encoder, attach_fn, dummy, args.n_warmup, args.n_runs,
                               f"{args.tome_algo} r={args.tome_ratio}")
         remove_tome_patch(encoder)
