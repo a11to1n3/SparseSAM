@@ -33,6 +33,10 @@ class SheafSAM3Block(Block):
     """Block forward with sheaf-energy-guided MLP keep-set selection."""
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        with torch.no_grad():
+            return self._forward_impl(x)
+
+    def _forward_impl(self, x: torch.Tensor) -> torch.Tensor:
         info = self._tome_info
         ratio = float(info["ratio"])
         mlp_merge = bool(info.get("mlp_merge", True))
@@ -56,15 +60,23 @@ class SheafSAM3Block(Block):
             x_seq = x.reshape(B, N, C)
             keep_n = max(1, round(ratio * N))
 
-            # Use identity sheaf energy to score tokens
-            sheaf_project_dim = int(info.get("sheaf_project_dim", 16))
-            token_energy = identity_sheaf_token_energy(
-                x_seq, H=H, W=W,
-                project_dim=sheaf_project_dim,
-                normalize=True,
-                edge_reduce="mean",
-            )
-            keep_idx = token_energy.topk(keep_n, dim=1, largest=True).indices
+            # Cache key: same (H, W, ratio) → same Z-order indices.
+            # Recompute sheaf energy only when cache misses (like SAM-HQ).
+            cache_key = (H, W, keep_n)
+            perm_cache = info.setdefault("perm_cache", {})
+
+            if cache_key not in perm_cache:
+                sheaf_project_dim = int(info.get("sheaf_project_dim", 16))
+                token_energy = identity_sheaf_token_energy(
+                    x_seq, H=H, W=W,
+                    project_dim=sheaf_project_dim,
+                    normalize=True,
+                    edge_reduce="mean",
+                )
+                keep_idx = token_energy.topk(keep_n, dim=1, largest=True).indices
+                perm_cache[cache_key] = keep_idx
+
+            keep_idx = perm_cache[cache_key]
             idx_e = keep_idx.unsqueeze(-1).expand(B, -1, C)
 
             x_kept = x_seq.gather(1, idx_e)
@@ -126,6 +138,7 @@ def remove_patch(encoder: nn.Module) -> int:
         if type(module) is SheafSAM3Block:
             module.__class__ = Block
             module.__dict__.pop("_tome_info", None)
+            module.__dict__.pop("_forward_impl", None)
             n += 1
     encoder.__dict__.pop("tome_info", None)
     return n

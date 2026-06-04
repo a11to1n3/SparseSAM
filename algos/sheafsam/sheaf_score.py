@@ -284,7 +284,7 @@ class SheafScore:
         if self.normalize:
             z_i = F.normalize(z_i, dim=-1, eps=1e-6)
             z_c = F.normalize(z_c, dim=-1, eps=1e-6)
-        return (z_i @ z_c.T).squeeze(-1)
+        return (z_i @ z_c.mT).squeeze(0)  # (N_tokens, n_concepts) → (B, N, n_concepts) when B=1
 
     def object_score(
         self,

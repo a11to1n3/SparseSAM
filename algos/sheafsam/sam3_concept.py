@@ -58,7 +58,7 @@ class SheafConceptDetector(nn.Module):
         spatial = self.scorer.spatial_coboundary(image_k, self.H, self.W, graph="4")
         concept_rel = self.scorer.concept_score(image_k, concept_emb)
 
-        score = spatial + concept_rel
+        score = spatial + concept_rel.amax(dim=-1) if concept_rel.dim() >= 2 else spatial + concept_rel
 
         if exemplar_emb is not None:
             exemplar_rel = self.scorer.concept_score(image_k, exemplar_emb)
