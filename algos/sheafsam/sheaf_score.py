@@ -257,7 +257,7 @@ class SheafScore:
             z_o = chunk_project(obj_ptr, project_dim=self.project_dim)
             if self.normalize:
                 z_o = F.normalize(z_o, dim=-1, eps=1e-6)
-            obj_rel = (z_o @ z_m.T).squeeze(0)
+            obj_rel = (z_o.squeeze(0) @ z_m.squeeze(0).mT)
             rel = rel + obj_rel
         return rel
 
