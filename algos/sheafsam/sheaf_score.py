@@ -159,7 +159,8 @@ class SheafScore:
             (B, H*W) per-token energy.
         """
         grid = keys.view(keys.shape[0], H, W, -1).float()
-        z = chunk_project(grid, project_dim=self.project_dim)
+        # Sobel operates on full K features by default (no projection)
+        z = grid if self.project_dim <= 0 else chunk_project(grid, project_dim=self.project_dim)
         if self.normalize:
             z = F.normalize(z, dim=-1, eps=1e-6)
 
@@ -251,7 +252,7 @@ class SheafScore:
         if self.normalize:
             z_q = F.normalize(z_q, dim=-1, eps=1e-6)
             z_m = F.normalize(z_m, dim=-1, eps=1e-6)
-        rel = (z_q @ z_m.T).max(dim=1).values.squeeze(0)
+        rel = (z_q.squeeze(0) @ z_m.squeeze(0).mT).max(dim=1).values
         if obj_ptr is not None:
             z_o = chunk_project(obj_ptr, project_dim=self.project_dim)
             if self.normalize:

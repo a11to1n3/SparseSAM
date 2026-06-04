@@ -28,12 +28,13 @@ from segment_anything.modeling.image_encoder import (
 from ..sparsesam.hilbert_utils import get_hilbert_order
 from ..sparsesam.z_utils import get_z_order
 from .sheaf_utils import (
-    identity_sheaf_token_energy,
-    zscore_like,
+    identity_sheaf_token_energy,  # still used by MLP routing
+    zscore_like as _zscore_like,
     sobel_sheaf_token_energy,
-    graph_coboundary_token_energy,
     group_score_from_token_energy,
+    graph_coboundary_token_energy,
 )
+from .sheaf_merge import build_sheaf_cell_merge
 
 TRUE_COB_SCORE_MODES = {
     "coboundary4", "coboundary4_full",
@@ -180,10 +181,21 @@ def tile_stride_matching(
         x_grp  = x_b.view(B, n_groups, gs, C)
 
         if ranking == "sort":
+            from .sheaf_score import SheafScore, zscore as zs
+
+            scorer = SheafScore(
+                project_dim=sheaf_project_dim,
+                normalize=True,
+                edge_reduce="mean",
+                degree_normalize=True,
+            )
+
             sparse_score = None
             sheaf_score = None
+            sobel_score = None
+            cob_score = None
 
-            # Compute SparseSAM score only when needed
+            # ── SparseSAM score ──────────────────────────────────────
             if score_mode in ("sparse", "hybrid"):
                 grp_std = x_grp.std(dim=2, correction=0).mean(dim=-1)
                 grp_mean = x_grp.mean(dim=2)
@@ -191,37 +203,24 @@ def tile_stride_matching(
                 sim = gm_norm @ gm_norm.transpose(1, 2)
                 avg_sim = (sim.sum(dim=-1) - 1.0) / max(n_groups - 1, 1)
                 dissim = -avg_sim
-                sparse_score = zscore_like(grp_std) + zscore_like(dissim)
+                sparse_score = zs(grp_std) + zs(dissim)
 
-            # Compute sheaf energy only when needed
+            # ── Sheaf sheaf (4-neighbor projected) ───────────────────
             if score_mode in ("sheaf", "sheaf_full", "hybrid", "shuffled_sheaf"):
                 pd = 0 if score_mode == "sheaf_full" else sheaf_project_dim
-                token_energy = identity_sheaf_token_energy(
-                    x, H=H, W=W, project_dim=pd,
-                    normalize=True, edge_reduce="mean",
-                )
+                s = SheafScore(project_dim=pd, normalize=True, degree_normalize=True)
+                te = s.spatial_sheaf(x, H, W)
                 if score_mode == "shuffled_sheaf":
-                    rand = torch.randperm(token_energy.shape[1], device=device)
-                    token_energy = token_energy[:, rand]
-                sheaf_score = group_score_from_token_energy(
-                    token_energy=token_energy, base_perm=base_perm,
-                    group_size=gs, reduce=sheaf_group_reduce,
-                )
-                sheaf_score = zscore_like(sheaf_score)
+                    te = te[:, torch.randperm(te.shape[1], device=device)]
+                sheaf_score = zs(scorer.group_score(te, base_perm, gs, sheaf_group_reduce))
 
-            # Sobel-K / sobel_sheaf
+            # ── Sobel-sheaf ──────────────────────────────────────────
             if score_mode in ("sobel_sheaf", "sobel_k"):
-                token_energy = sobel_sheaf_token_energy(
-                    x, H=H, W=W, project_dim=0,
-                    normalize=True, reduce="mean", padding_mode="replicate",
-                )
-                sobel_score = group_score_from_token_energy(
-                    token_energy=token_energy, base_perm=base_perm,
-                    group_size=gs, reduce=sheaf_group_reduce,
-                )
-                sobel_score = zscore_like(sobel_score)
+                s = SheafScore(project_dim=0, normalize=True)
+                te = s.spatial_sobel(x, H, W)
+                sobel_score = zs(scorer.group_score(te, base_perm, gs, sheaf_group_reduce))
 
-            # True graph coboundary (strict incidence-based, no convolution)
+            # ── True graph coboundary ────────────────────────────────
             if score_mode in TRUE_COB_SCORE_MODES:
                 if score_mode.startswith("coboundary8") or score_mode == "laplacian8":
                     graph = "8"
@@ -231,17 +230,11 @@ def tile_stride_matching(
                     graph = "4"
                 pd = 0 if score_mode.endswith("_full") else sheaf_project_dim
                 sk = "laplacian_residual" if score_mode.startswith("laplacian") else "edge_energy"
-                token_energy = graph_coboundary_token_energy(
-                    x, H=H, W=W, project_dim=pd, graph=graph,
-                    normalize=True, edge_reduce="mean",
-                    degree_normalize=True, score_kind=sk,
-                )
-                cob_score = group_score_from_token_energy(
-                    token_energy=token_energy, base_perm=base_perm,
-                    group_size=gs, reduce=sheaf_group_reduce,
-                )
-                cob_score = zscore_like(cob_score)
+                s = SheafScore(project_dim=pd, normalize=True, degree_normalize=True)
+                te = s.spatial_coboundary(x, H, W, graph=graph, score_kind=sk)
+                cob_score = zs(scorer.group_score(te, base_perm, gs, sheaf_group_reduce))
 
+            # ── Final dispatch ───────────────────────────────────────
             if score_mode == "sparse":
                 grp_score = sparse_score
             elif score_mode in ("sheaf", "sheaf_full", "shuffled_sheaf"):
